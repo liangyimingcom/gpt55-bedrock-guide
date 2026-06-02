@@ -18,6 +18,7 @@
 - [Step 5: 配置 Codex CLI (可选)](#step-5-配置-codex-cli-可选)
 - [验证结果](#验证结果)
 - [注意事项](#注意事项)
+- [关键发现与踩坑记录](#关键发现与踩坑记录)
 - [参考链接](#参考链接)
 
 ---
@@ -305,6 +306,90 @@ CLI 会自动读取 `~/.codex/config.toml` 和 `~/.codex/.env` 中的配置。
    - `openai.gpt-5.4` — 最佳性价比
    - `openai.gpt-oss-120b` — 开源大模型
    - `openai.gpt-oss-20b` — 开源小模型
+
+---
+
+## 关键发现与踩坑记录
+
+> ⚠️ 以下为 2026-06-02 实测发现，部分结论尚未在 AWS 官方文档中完整说明，标记为"未证实"的条目仅供参考。
+
+### 🔴 已证实的关键结论
+
+**1. GPT-5.5 不走经典 bedrock-runtime**
+
+GPT-5.5 **不**使用传统的 `bedrock-runtime`（InvokeModel / Converse API）。尝试通过经典路径调用会报 `invalid model identifier`。它走的是全新的 **OpenAI 兼容 mantle 网关**：
+
+```
+✅ bedrock-mantle.us-east-2.api.aws/openai/v1   ← 正确
+❌ bedrock-runtime.us-east-2.amazonaws.com       ← 不支持 GPT-5.x
+```
+
+**2. Region 限制严格：仅 us-east-2**
+
+GPT-5.5 目前**仅在 us-east-2 (Ohio)** 可用。us-west-2、us-east-1 均无法查到或调用该模型。GPT-5.4 额外支持 us-west-2。
+
+**3. 只支持 Responses API，不支持 Chat Completions**
+
+唯一支持的 API 路径是 `/v1/responses`（即 `client.responses.create`）。**不支持** `/v1/chat/completions`。这是 GPT-5.x 系列前沿推理模型在 Bedrock 上的架构限制。
+
+```python
+# ✅ 正确
+client.responses.create(model="openai.gpt-5.5", input=[...])
+
+# ❌ 不支持
+client.chat.completions.create(model="openai.gpt-5.5", messages=[...])
+```
+
+**4. 鉴权 = Bedrock Bearer Token（短期有效）**
+
+使用 `aws-bedrock-token-generator` 从当前 AWS IAM 角色/用户凭证生成短期 Bearer Token（有效期最长 **12小时**），然后作为 `OPENAI_API_KEY` 或 `AWS_BEARER_TOKEN_BEDROCK` 传给 SDK。
+
+```bash
+# 生成 token（需要 aws-bedrock-token-generator 工具）
+export AWS_BEARER_TOKEN_BEDROCK=$(aws-bedrock-token-generator --region us-east-2)
+
+# Token 格式：ABSK 前缀 + Base64 编码
+# 有效期：最长 12 小时，过期需重新生成
+```
+
+### 🟡 未证实但值得注意的发现
+
+**5. Role 命名：`developer` 替代 `system`**
+
+Responses API 使用 `"role": "developer"` 而非传统 Chat Completions 的 `"role": "system"`。这是 GPT-5.x 系列引入的新角色命名。是否仍兼容 `system` 角色尚未验证。
+
+**6. GPT-5.4 的 reasoning.effort 默认为 `none`**
+
+如果不显式设置 `reasoning.effort`，GPT-5.4 默认**不进行推理**。这是一个容易踩的坑——看似模型"变笨了"，实际是缺少 effort 参数。
+
+**7. 限流策略：排队而非拒绝**
+
+高峰期不会返回 429 (Too Many Requests)，而是将请求**排队等待**。这意味着：
+- 客户端不会收到错误码
+- 但响应延迟可能大幅增加
+- 需设置合理的 timeout（建议 ≥ 60s）
+
+**8. 额外可用模型**
+
+除 GPT-5.5/5.4 外，Bedrock Mantle 还支持：
+- `openai.gpt-oss-120b` — 开源大模型
+- `openai.gpt-oss-20b` — 开源小模型
+
+**9. 数据驻留保证**
+
+所有推理处理在所选 Bedrock Region 内完成，数据不跨 Region 传输。对有合规要求的场景（金融、医疗、政府）尤为重要。
+
+### ⚡ 踩坑速查表
+
+| 踩坑场景 | 症状 | 解决方案 |
+|----------|------|----------|
+| 用 bedrock-runtime 调用 | `invalid model identifier` | 改用 `bedrock-mantle` 端点 |
+| 在 us-west-2 / us-east-1 调用 | 找不到模型 | 切换到 `us-east-2` |
+| 用 chat.completions API | 404 或不支持 | 改用 `responses.create` |
+| GPT-5.4 回答太简短/无推理 | 默认 effort=none | 显式设置 `reasoning.effort` |
+| Token 过期 | 401 Unauthorized | 重新生成 bearer token |
+| macOS python3 版本不对 | ModuleNotFoundError: openai | 用 `python3.11` 或检查 `which python3` |
+| 高峰期响应超慢 | 无错误但延迟大 | 设置 timeout ≥ 60s，请求在排队 |
 
 ---
 
